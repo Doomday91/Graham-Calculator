@@ -515,7 +515,7 @@ tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <body>
 <canvas id="bg"></canvas>
 
-<div class="version-badge">V1.14</div>
+<div class="version-badge">V1.15</div>
 
 <div class="api-badge">
   API laatste min: <b id="api-count">0</b> / 60
@@ -867,8 +867,14 @@ async function fmpKeyMetrics(symbol) {
 
 /* ══════════════════════════════════════════════════════════════════════
    API CALLS — Yahoo Finance (derde fallback, geen key nodig)
-   Dekt Europese aandelen die Finnhub/FMP free niet ondersteunen.
+   Via CORS-proxy omdat Yahoo Finance directe browser-aanroepen blokkeert.
 ══════════════════════════════════════════════════════════════════════ */
+const YF_PROXY = 'https://corsproxy.io/?';
+
+function yfFetch(url) {
+  return fetch(YF_PROXY + encodeURIComponent(url));
+}
+
 async function yahooQuote(symbol) {
   const cacheKey = 'yf_quote_' + symbol;
   const cached = cacheGet(cacheKey, TTL_DATA);
@@ -878,8 +884,8 @@ async function yahooQuote(symbol) {
   }
 
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
-  const resp = await fetch(url);
-  console.log(`[Yahoo] quote ${symbol}: status=${resp.status}`);
+  console.log(`[Yahoo] quote ${symbol}: ophalen via proxy…`);
+  const resp = await yfFetch(url);
   if (!resp.ok) throw makeApiError(`Yahoo quote ${resp.status}`, resp.status);
   const json = await resp.json();
   const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
@@ -900,16 +906,16 @@ async function yahooStats(symbol) {
   }
 
   const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=defaultKeyStatistics`;
-  const resp = await fetch(url);
-  console.log(`[Yahoo] stats ${symbol}: status=${resp.status}`);
+  console.log(`[Yahoo] stats ${symbol}: ophalen via proxy…`);
+  const resp = await yfFetch(url);
   if (!resp.ok) throw makeApiError(`Yahoo stats ${resp.status}`, resp.status);
   const json = await resp.json();
   const stats = json?.quoteSummary?.result?.[0]?.defaultKeyStatistics;
   if (!stats) throw makeApiError(`Geen Yahoo stats voor ${symbol}`, 404);
 
   const data = {
-    eps:       stats.trailingEps?.raw  ?? null,
-    bookValue: stats.bookValue?.raw    ?? null,
+    eps:       stats.trailingEps?.raw ?? null,
+    bookValue: stats.bookValue?.raw   ?? null,
   };
   cacheSet(cacheKey, data);
   console.log(`[Yahoo] stats ${symbol}: eps=${data.eps}, bvps=${data.bookValue}`);
