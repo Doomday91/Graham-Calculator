@@ -515,7 +515,7 @@ tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <body>
 <canvas id="bg"></canvas>
 
-<div class="version-badge">V1.12</div>
+<div class="version-badge">V1.13</div>
 
 <div class="api-badge">
   API laatste min: <b id="api-count">0</b> / 60
@@ -557,7 +557,7 @@ tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
           <button class="filter-btn"        data-filter="onbekend"  disabled>Onbekend</button>
         </div>
         <div class="toolbar-right">
-          <button class="btn-download" id="btn-download" disabled>↓ Download XML</button>
+          <button class="btn-download" id="btn-download" disabled>↓ Download CSV</button>
         </div>
       </div>
 
@@ -1145,26 +1145,39 @@ async function fetchStock(stock) {
   }
 
   // FMP fallback: als Finnhub geen (volledige) data gaf, probeer FMP
+  // Voor Europese aandelen proberen we ook veelgebruikte exchange-suffixen (.AS .PA .L .DE .MI .BR)
   const needsFmp = (result.price == null || result.eps == null || result.bookValue == null)
                    && FMP_KEY !== 'JOUW_FMP_KEY_HIER';
   if (needsFmp) {
-    try {
-      const sym = result.usedSymbol;
-      if (result.price == null || result.eps == null) {
-        const fmpQ = await fmpQuote(sym);
-        if (result.price == null) result.price = fmpQ.price ?? null;
-        if (result.eps   == null) result.eps   = fmpQ.eps   ?? null;
+    const base = result.usedSymbol.split('.')[0];
+    const hasExt = result.usedSymbol.includes('.');
+    const fmpCandidates = hasExt
+      ? [result.usedSymbol, base]
+      : [result.usedSymbol, `${base}.AS`, `${base}.PA`, `${base}.L`, `${base}.DE`, `${base}.MI`, `${base}.BR`];
+
+    for (const fSym of fmpCandidates) {
+      try {
+        if (result.price == null || result.eps == null) {
+          const fmpQ = await fmpQuote(fSym);
+          if (result.price == null) result.price = fmpQ.price ?? null;
+          if (result.eps   == null) result.eps   = fmpQ.eps   ?? null;
+        }
+        if (result.bookValue == null) {
+          const fmpM = await fmpKeyMetrics(fSym);
+          result.bookValue = fmpM.bookValuePerShareTTM ?? null;
+          if (result.eps == null) result.eps = fmpM.netIncomePerShareTTM ?? null;
+        }
+        const gotData = result.price != null || result.eps != null || result.bookValue != null;
+        if (gotData) {
+          if (fSym !== result.usedSymbol) result.usedSymbol = fSym;
+          if (result.fiscalYear == null) result.fiscalYear = 'FMP TTM';
+          else result.fiscalYear += '+FMP';
+          console.log(`[FMP] fallback succesvol via ${fSym}: price=${result.price}, eps=${result.eps}, bvps=${result.bookValue}`);
+          break;
+        }
+      } catch (e) {
+        console.warn(`[FMP] ${fSym} mislukt:`, e.message);
       }
-      if (result.bookValue == null) {
-        const fmpM = await fmpKeyMetrics(sym);
-        result.bookValue = fmpM.bookValuePerShareTTM ?? null;
-        if (result.eps == null) result.eps = fmpM.netIncomePerShareTTM ?? null;
-      }
-      if (result.fiscalYear == null) result.fiscalYear = 'FMP TTM';
-      else result.fiscalYear += '+FMP';
-      console.log(`[FMP] fallback succesvol voor ${sym}: price=${result.price}, eps=${result.eps}, bvps=${result.bookValue}`);
-    } catch (e) {
-      console.warn(`[FMP] fallback mislukt voor ${result.usedSymbol}:`, e.message);
     }
   }
 
@@ -1296,40 +1309,47 @@ function setToolbarEnabled(on) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
-   XML DOWNLOAD
+   CSV DOWNLOAD (Excel-compatibel)
 ══════════════════════════════════════════════════════════════════════ */
-function escXml(v) {
-  if (v == null) return '';
-  return String(v)
-    .replace(/&/g,  '&amp;')
-    .replace(/</g,  '&lt;')
-    .replace(/>/g,  '&gt;')
-    .replace(/"/g,  '&quot;')
-    .replace(/'/g,  '&apos;');
-}
+function downloadCsv() {
+  const now = new Date().toLocaleString('nl-NL');
+  const fmt  = (v, dec = 2) => v != null ? Number(v).toFixed(dec) : '';
+  const cell = v => {
+    const s = String(v == null ? '' : v);
+    // Aanhalingstekens escapen en cel inpakken als er komma's/aanhalingstekens in zitten
+    return s.includes(',') || s.includes('"') || s.includes('\n')
+      ? '"' + s.replace(/"/g, '""') + '"'
+      : s;
+  };
 
-function downloadXml() {
-  const iso  = new Date().toISOString();
-  const fmt4 = v => (v != null ? Number(v).toFixed(4) : '');
+  const headers = [
+    'Bedrijf', 'Ticker', 'Valuta', 'Koers', 'EPS',
+    'Boekwaarde/aandeel', 'Graham Number', 'Verschil %', 'Label', 'Databron'
+  ];
 
-  const nodes = analysisData.map(d => `  <stock>
-    <symbol>${escXml(d.symbol)}</symbol>
-    <name>${escXml(d.name)}</name>
-    <usedSymbol>${escXml(d.usedSymbol)}</usedSymbol>
-    <price>${fmt4(d.price)}</price>
-    <eps>${fmt4(d.eps)}</eps>
-    <bookValuePerShare>${fmt4(d.bookValue)}</bookValuePerShare>
-    <grahamNumber>${fmt4(d.graham)}</grahamNumber>
-    <differencePercent>${fmt4(d.diff)}</differencePercent>
-    <label>${escXml(d.label)}</label>
-    <fiscalYear>${escXml(d.fiscalYear)}</fiscalYear>
-  </stock>`).join('\n');
+  const rows = analysisData.map(d => [
+    d.name,
+    d.usedSymbol,
+    d.currency || '',
+    fmt(d.price),
+    fmt(d.eps, 4),
+    fmt(d.bookValue, 4),
+    fmt(d.graham),
+    fmt(d.diff, 2),
+    d.label,
+    d.fiscalYear || '',
+  ]);
 
-  const xml  = `<?xml version="1.0" encoding="UTF-8"?>\n<stockAnalysis generatedAt="${escXml(iso)}">\n${nodes}\n</stockAnalysis>`;
-  const blob = new Blob([xml], { type: 'application/xml;charset=utf-8' });
+  const csv = [headers, ...rows]
+    .map(r => r.map(cell).join(';'))   // puntkomma als scheidingsteken (standaard NL Excel)
+    .join('\r\n');
+
+  // BOM zodat Excel UTF-8 correct herkent (accenten, €-tekens, etc.)
+  const bom  = '﻿';
+  const blob = new Blob([bom + csv], { type: 'text/csv;charset=utf-8;' });
   const a    = document.createElement('a');
   a.href     = URL.createObjectURL(blob);
-  a.download = 'stock-analysis.xml';
+  a.download = `aandelen-analyse-${new Date().toISOString().slice(0,10)}.csv`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -1566,7 +1586,7 @@ function init() {
   });
 
   document.getElementById('btn-analyze').addEventListener('click', runAnalysis);
-  document.getElementById('btn-download').addEventListener('click', downloadXml);
+  document.getElementById('btn-download').addEventListener('click', downloadCsv);
   document.getElementById('btn-clear-cache').addEventListener('click', () => {
     const n = clearDataCache();
     setStatus(`Cache gewist (${n} entries). Klik "Analyseer portfolio" om opnieuw op te halen.`);
