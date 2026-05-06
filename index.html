@@ -100,18 +100,18 @@ html, body {
 .panel {
   width: 100%; max-width: 1120px;
   background: linear-gradient(145deg,
-    rgba(22, 40, 75, 0.82) 0%,
-    rgba(14, 26, 54, 0.78) 50%,
-    rgba(18, 34, 68, 0.80) 100%);
+    rgba(22, 40, 75, 0.58) 0%,
+    rgba(14, 26, 54, 0.52) 50%,
+    rgba(18, 34, 68, 0.56) 100%);
   border: 1px solid var(--panel-border);
   border-radius: 18px;
-  backdrop-filter: blur(28px);
+  backdrop-filter: blur(12px);
   padding: 30px 28px;
   box-shadow:
-    0 30px 70px rgba(0,0,0,0.45),
-    0 0 0 1px rgba(255,255,255,0.04),
-    inset 0 1px 0 rgba(255,255,255,0.08),
-    inset 0 0 80px rgba(56,189,248,0.03);
+    0 30px 70px rgba(0,0,0,0.35),
+    0 0 0 1px rgba(255,255,255,0.05),
+    inset 0 1px 0 rgba(255,255,255,0.10),
+    inset 0 0 80px rgba(56,189,248,0.04);
 }
 
 .section-label {
@@ -515,7 +515,7 @@ tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <body>
 <canvas id="bg"></canvas>
 
-<div class="version-badge">V1.13</div>
+<div class="version-badge">V1.14</div>
 
 <div class="api-badge">
   API laatste min: <b id="api-count">0</b> / 60
@@ -865,13 +865,65 @@ async function fmpKeyMetrics(symbol) {
   return data;
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   API CALLS — Yahoo Finance (derde fallback, geen key nodig)
+   Dekt Europese aandelen die Finnhub/FMP free niet ondersteunen.
+══════════════════════════════════════════════════════════════════════ */
+async function yahooQuote(symbol) {
+  const cacheKey = 'yf_quote_' + symbol;
+  const cached = cacheGet(cacheKey, TTL_DATA);
+  if (cached && cached.price > 0) {
+    console.log(`[Yahoo] quote ${symbol}: cache hit (price=${cached.price})`);
+    return cached;
+  }
+
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
+  const resp = await fetch(url);
+  console.log(`[Yahoo] quote ${symbol}: status=${resp.status}`);
+  if (!resp.ok) throw makeApiError(`Yahoo quote ${resp.status}`, resp.status);
+  const json = await resp.json();
+  const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
+  if (!price) throw makeApiError(`Geen Yahoo quote voor ${symbol}`, 404);
+
+  const data = { price, currency: json?.chart?.result?.[0]?.meta?.currency ?? '' };
+  cacheSet(cacheKey, data);
+  console.log(`[Yahoo] quote ${symbol}: price=${price}`);
+  return data;
+}
+
+async function yahooStats(symbol) {
+  const cacheKey = 'yf_stats_' + symbol;
+  const cached = cacheGet(cacheKey, TTL_DATA);
+  if (cached) {
+    console.log(`[Yahoo] stats ${symbol}: cache hit`);
+    return cached;
+  }
+
+  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=defaultKeyStatistics`;
+  const resp = await fetch(url);
+  console.log(`[Yahoo] stats ${symbol}: status=${resp.status}`);
+  if (!resp.ok) throw makeApiError(`Yahoo stats ${resp.status}`, resp.status);
+  const json = await resp.json();
+  const stats = json?.quoteSummary?.result?.[0]?.defaultKeyStatistics;
+  if (!stats) throw makeApiError(`Geen Yahoo stats voor ${symbol}`, 404);
+
+  const data = {
+    eps:       stats.trailingEps?.raw  ?? null,
+    bookValue: stats.bookValue?.raw    ?? null,
+  };
+  cacheSet(cacheKey, data);
+  console.log(`[Yahoo] stats ${symbol}: eps=${data.eps}, bvps=${data.bookValue}`);
+  return data;
+}
+
 // Wis alle gecachede koers-, metric- en profile-data (zoekresultaten blijven staan)
 function clearDataCache() {
   let cleared = 0;
   for (let i = localStorage.length - 1; i >= 0; i--) {
     const k = localStorage.key(i);
     if (k && k.startsWith(CACHE_NS) &&
-        (k.includes('quote_') || k.includes('metric_') || k.includes('profile_') || k.includes('fmp_'))) {
+        (k.includes('quote_') || k.includes('metric_') || k.includes('profile_') ||
+         k.includes('fmp_')   || k.includes('yf_'))) {
       localStorage.removeItem(k);
       cleared++;
     }
@@ -1177,6 +1229,40 @@ async function fetchStock(stock) {
         }
       } catch (e) {
         console.warn(`[FMP] ${fSym} mislukt:`, e.message);
+      }
+    }
+  }
+
+  // Yahoo Finance als derde fallback — dekt Europese aandelen zonder API-key
+  const needsYahoo = result.price == null || result.eps == null || result.bookValue == null;
+  if (needsYahoo) {
+    const base = result.usedSymbol.split('.')[0];
+    const yfCandidates = result.usedSymbol.includes('.')
+      ? [result.usedSymbol, base]
+      : [result.usedSymbol, `${base}.AS`, `${base}.PA`, `${base}.L`, `${base}.DE`];
+
+    for (const ySym of yfCandidates) {
+      try {
+        const [qRes, sRes] = await Promise.allSettled([
+          result.price == null ? yahooQuote(ySym) : Promise.resolve(null),
+          (result.eps == null || result.bookValue == null) ? yahooStats(ySym) : Promise.resolve(null),
+        ]);
+        if (qRes.status === 'fulfilled' && qRes.value?.price) {
+          result.price = qRes.value.price;
+          if (!result.currency && qRes.value.currency) result.currency = qRes.value.currency;
+        }
+        if (sRes.status === 'fulfilled' && sRes.value) {
+          if (result.eps       == null) result.eps       = sRes.value.eps       ?? null;
+          if (result.bookValue == null) result.bookValue = sRes.value.bookValue ?? null;
+        }
+        if (result.price != null || result.eps != null || result.bookValue != null) {
+          if (ySym !== result.usedSymbol) result.usedSymbol = ySym;
+          result.fiscalYear = result.fiscalYear ? result.fiscalYear + '+YF' : 'Yahoo TTM';
+          console.log(`[Yahoo] fallback succesvol via ${ySym}: price=${result.price}, eps=${result.eps}, bvps=${result.bookValue}`);
+          break;
+        }
+      } catch (e) {
+        console.warn(`[Yahoo] ${ySym} mislukt:`, e.message);
       }
     }
   }
