@@ -378,6 +378,45 @@ tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
   color: var(--text-dim); font-size: 0.83rem;
 }
 
+/* ── MANUAL ENTRY ── */
+.btn-manual {
+  background: rgba(56,189,248,0.12);
+  border: 1px solid rgba(56,189,248,0.3);
+  color: var(--accent);
+  padding: 3px 9px; border-radius: 4px;
+  font-size: 0.7rem; cursor: pointer;
+  font-family: inherit; margin-left: 4px;
+  transition: all 0.18s;
+}
+.btn-manual:hover { background: rgba(56,189,248,0.22); }
+.btn-manual.btn-save {
+  color: var(--accent-green);
+  border-color: rgba(52,211,153,0.4);
+  background: rgba(52,211,153,0.12);
+}
+.btn-manual.btn-save:hover { background: rgba(52,211,153,0.22); }
+.btn-manual.btn-cancel {
+  color: var(--danger);
+  border-color: rgba(248,113,113,0.4);
+  background: rgba(248,113,113,0.1);
+}
+.btn-manual.btn-cancel:hover { background: rgba(248,113,113,0.18); }
+
+.manual-input {
+  width: 90px;
+  background: rgba(0,0,0,0.4);
+  border: 1px solid rgba(56,189,248,0.4);
+  color: var(--text-primary);
+  padding: 4px 7px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+  font-family: inherit;
+}
+.manual-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(56,189,248,0.15); }
+
 /* ── RESPONSIVE — tablet ── */
 @media (max-width: 768px) {
   .panel { padding: 22px 18px; }
@@ -515,7 +554,7 @@ tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <body>
 <canvas id="bg"></canvas>
 
-<div class="version-badge">V1.16</div>
+<div class="version-badge">V1.17</div>
 
 <div class="api-badge">
   API laatste min: <b id="api-count">0</b> / 60
@@ -877,19 +916,28 @@ async function yahooAll(symbol) {
     return cached;
   }
 
-  // Één call: koers + EPS + boekwaarde tegelijk
   const target = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=price,defaultKeyStatistics`;
-  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`;
+  // /get endpoint wikkelt response in JSON met CORS-headers (betrouwbaarder dan /raw)
+  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(target)}`;
 
-  console.log(`[Yahoo] ${symbol}: ophalen via allorigins proxy…`);
+  console.log(`[Yahoo] ${symbol}: ophalen via allorigins/get…`);
   const resp = await fetch(proxyUrl);
-  if (!resp.ok) throw makeApiError(`Yahoo ${resp.status}`, resp.status);
-  const json = await resp.json();
+  if (!resp.ok) throw makeApiError(`Yahoo proxy ${resp.status}`, resp.status);
+  const wrapper = await resp.json();
+  if (!wrapper || !wrapper.contents) throw makeApiError(`Lege Yahoo response`, 502);
+
+  let json;
+  try { json = JSON.parse(wrapper.contents); }
+  catch { throw makeApiError(`Yahoo response onleesbaar`, 502); }
 
   const priceModule = json?.quoteSummary?.result?.[0]?.price;
   const stats       = json?.quoteSummary?.result?.[0]?.defaultKeyStatistics;
 
-  if (!priceModule && !stats) throw makeApiError(`Geen Yahoo data voor ${symbol}`, 404);
+  if (!priceModule && !stats) {
+    const yfErr = json?.quoteSummary?.error;
+    if (yfErr) throw makeApiError(`Yahoo: ${yfErr.description || yfErr.code}`, 404);
+    throw makeApiError(`Geen Yahoo data voor ${symbol}`, 404);
+  }
 
   const data = {
     price:     priceModule?.regularMarketPrice?.raw ?? null,
@@ -1322,22 +1370,87 @@ function renderTable() {
       onbekend: 'badge-onbekend',
     }[d.label] || 'badge-onbekend';
 
-    return `<tr>
+    const editing = d._manual === true;
+    const sym = escHtml(d.symbol);
+    const inp = (field, value) =>
+      `<input class="manual-input" type="number" step="0.01" data-field="${field}" data-symbol="${sym}" value="${value != null ? value : ''}" placeholder="...">`;
+
+    const priceCell  = editing ? inp('price', d.price)
+                      : (d.price != null ? cur + n(d.price) : '—');
+    const epsCell    = editing ? inp('eps', d.eps)
+                      : (d.eps != null ? n(d.eps) : '—');
+    const bvCell     = editing ? inp('bookValue', d.bookValue)
+                      : (d.bookValue != null ? n(d.bookValue) : '—');
+    const grahamCell = editing ? '—'
+                      : (d.graham != null ? cur + n(d.graham) : '—');
+    const pctCell    = editing ? '—' : pct(d.diff);
+    const labelCell  = editing
+                      ? '<span style="color:var(--text-dim);font-size:0.7rem">bewerken…</span>'
+                      : `<span class="badge ${badgeClass}">${escHtml(d.label)}</span>`;
+
+    let dataCell;
+    if (editing) {
+      dataCell = `
+        <button class="btn-manual btn-save"   data-action="save"   data-symbol="${sym}">✓ Opslaan</button>
+        <button class="btn-manual btn-cancel" data-action="cancel" data-symbol="${sym}">✕</button>`;
+    } else if (d.errorNote) {
+      dataCell = `<span style="color:#fbbf24">⚠ ${escHtml(d.errorNote)}</span>
+                  <button class="btn-manual" data-action="edit" data-symbol="${sym}" title="Voer EPS en boekwaarde handmatig in">✎ Handmatig</button>`;
+    } else {
+      const fy = d.fiscalYear || '—';
+      dataCell = `${escHtml(fy)}
+                  <button class="btn-manual" data-action="edit" data-symbol="${sym}" title="Bewerk handmatig">✎</button>`;
+    }
+
+    return `<tr data-symbol="${sym}">
       <td class="td-company">${escHtml(d.name)}</td>
       <td class="td-ticker">${escHtml(d.usedSymbol)}</td>
-      <td class="num">${d.price != null ? cur + n(d.price) : '—'}</td>
-      <td class="num">${d.eps   != null ? n(d.eps) : '—'}</td>
-      <td class="num">${d.bookValue != null ? n(d.bookValue) : '—'}</td>
-      <td class="num">${d.graham != null ? cur + n(d.graham) : '—'}</td>
-      <td class="num td-pct" style="color:${pctColor}">${pct(d.diff)}</td>
-      <td><span class="badge ${badgeClass}">${escHtml(d.label)}</span></td>
-      <td style="color:var(--text-secondary);font-size:0.78rem" title="${escHtml(d.errorNote || '')}">
-        ${d.errorNote
-          ? `<span style="color:#fbbf24">⚠ ${escHtml(d.errorNote)}</span>`
-          : escHtml(d.fiscalYear || '—')}
+      <td class="num" style="color:${editing ? 'inherit' : ''}">${editing ? '' : (d.price != null && cur ? `<span style="color:var(--text-dim);font-size:0.7rem">${cur}</span>` : '')}${priceCell}</td>
+      <td class="num">${epsCell}</td>
+      <td class="num">${bvCell}</td>
+      <td class="num">${grahamCell}</td>
+      <td class="num td-pct" style="color:${pctColor}">${pctCell}</td>
+      <td>${labelCell}</td>
+      <td style="color:var(--text-secondary);font-size:0.78rem;white-space:nowrap" title="${escHtml(d.errorNote || '')}">
+        ${dataCell}
       </td>
     </tr>`;
   }).join('');
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   MANUAL ENTRY — handlers voor edit/save/cancel
+══════════════════════════════════════════════════════════════════════ */
+function initManualEdit() {
+  document.getElementById('results-body').addEventListener('click', e => {
+    const btn = e.target.closest('.btn-manual');
+    if (!btn) return;
+    const symbol = btn.dataset.symbol;
+    const action = btn.dataset.action;
+    const stock  = analysisData.find(d => d.symbol === symbol);
+    if (!stock) return;
+
+    if (action === 'edit') {
+      stock._manual = true;
+    } else if (action === 'cancel') {
+      stock._manual = false;
+    } else if (action === 'save') {
+      const row = btn.closest('tr');
+      row.querySelectorAll('.manual-input').forEach(input => {
+        const raw = input.value.trim().replace(',', '.');
+        const v = raw === '' ? null : parseFloat(raw);
+        stock[input.dataset.field] = (v == null || isNaN(v)) ? null : v;
+      });
+      stock.graham = calcGraham(stock.eps, stock.bookValue);
+      stock.diff   = calcDiff(stock.graham, stock.price);
+      stock.label  = calcLabel(stock.diff);
+      stock.fiscalYear = 'Handmatig';
+      stock.errorNote = null;
+      stock.errorStatus = null;
+      stock._manual = false;
+    }
+    renderTable();
+  });
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1662,6 +1775,7 @@ function init() {
   initSorting();
   initFilter();
   initTooltips();
+  initManualEdit();
 
   // Run tests after a tick so canvas init message appears first
   setTimeout(runTests, 150);
