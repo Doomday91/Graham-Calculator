@@ -515,7 +515,7 @@ tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <body>
 <canvas id="bg"></canvas>
 
-<div class="version-badge">V1.15</div>
+<div class="version-badge">V1.16</div>
 
 <div class="api-badge">
   API laatste min: <b id="api-count">0</b> / 60
@@ -867,58 +867,39 @@ async function fmpKeyMetrics(symbol) {
 
 /* ══════════════════════════════════════════════════════════════════════
    API CALLS — Yahoo Finance (derde fallback, geen key nodig)
-   Via CORS-proxy omdat Yahoo Finance directe browser-aanroepen blokkeert.
+   allorigins.win proxyt de aanvraag zodat CORS geen probleem is.
 ══════════════════════════════════════════════════════════════════════ */
-const YF_PROXY = 'https://corsproxy.io/?';
-
-function yfFetch(url) {
-  return fetch(YF_PROXY + encodeURIComponent(url));
-}
-
-async function yahooQuote(symbol) {
-  const cacheKey = 'yf_quote_' + symbol;
-  const cached = cacheGet(cacheKey, TTL_DATA);
-  if (cached && cached.price > 0) {
-    console.log(`[Yahoo] quote ${symbol}: cache hit (price=${cached.price})`);
-    return cached;
-  }
-
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
-  console.log(`[Yahoo] quote ${symbol}: ophalen via proxy…`);
-  const resp = await yfFetch(url);
-  if (!resp.ok) throw makeApiError(`Yahoo quote ${resp.status}`, resp.status);
-  const json = await resp.json();
-  const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
-  if (!price) throw makeApiError(`Geen Yahoo quote voor ${symbol}`, 404);
-
-  const data = { price, currency: json?.chart?.result?.[0]?.meta?.currency ?? '' };
-  cacheSet(cacheKey, data);
-  console.log(`[Yahoo] quote ${symbol}: price=${price}`);
-  return data;
-}
-
-async function yahooStats(symbol) {
-  const cacheKey = 'yf_stats_' + symbol;
+async function yahooAll(symbol) {
+  const cacheKey = 'yf_all_' + symbol;
   const cached = cacheGet(cacheKey, TTL_DATA);
   if (cached) {
-    console.log(`[Yahoo] stats ${symbol}: cache hit`);
+    console.log(`[Yahoo] ${symbol}: cache hit`);
     return cached;
   }
 
-  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=defaultKeyStatistics`;
-  console.log(`[Yahoo] stats ${symbol}: ophalen via proxy…`);
-  const resp = await yfFetch(url);
-  if (!resp.ok) throw makeApiError(`Yahoo stats ${resp.status}`, resp.status);
+  // Één call: koers + EPS + boekwaarde tegelijk
+  const target = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=price,defaultKeyStatistics`;
+  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`;
+
+  console.log(`[Yahoo] ${symbol}: ophalen via allorigins proxy…`);
+  const resp = await fetch(proxyUrl);
+  if (!resp.ok) throw makeApiError(`Yahoo ${resp.status}`, resp.status);
   const json = await resp.json();
-  const stats = json?.quoteSummary?.result?.[0]?.defaultKeyStatistics;
-  if (!stats) throw makeApiError(`Geen Yahoo stats voor ${symbol}`, 404);
+
+  const priceModule = json?.quoteSummary?.result?.[0]?.price;
+  const stats       = json?.quoteSummary?.result?.[0]?.defaultKeyStatistics;
+
+  if (!priceModule && !stats) throw makeApiError(`Geen Yahoo data voor ${symbol}`, 404);
 
   const data = {
-    eps:       stats.trailingEps?.raw ?? null,
-    bookValue: stats.bookValue?.raw   ?? null,
+    price:     priceModule?.regularMarketPrice?.raw ?? null,
+    currency:  priceModule?.currency               ?? '',
+    eps:       stats?.trailingEps?.raw             ?? null,
+    bookValue: stats?.bookValue?.raw               ?? null,
   };
-  cacheSet(cacheKey, data);
-  console.log(`[Yahoo] stats ${symbol}: eps=${data.eps}, bvps=${data.bookValue}`);
+
+  if (data.price != null || data.eps != null) cacheSet(cacheKey, data);
+  console.log(`[Yahoo] ${symbol}: price=${data.price}, eps=${data.eps}, bvps=${data.bookValue}`);
   return data;
 }
 
@@ -929,7 +910,7 @@ function clearDataCache() {
     const k = localStorage.key(i);
     if (k && k.startsWith(CACHE_NS) &&
         (k.includes('quote_') || k.includes('metric_') || k.includes('profile_') ||
-         k.includes('fmp_')   || k.includes('yf_'))) {
+         k.includes('fmp_')   || k.includes('yf_all_'))) {
       localStorage.removeItem(k);
       cleared++;
     }
@@ -1249,22 +1230,16 @@ async function fetchStock(stock) {
 
     for (const ySym of yfCandidates) {
       try {
-        const [qRes, sRes] = await Promise.allSettled([
-          result.price == null ? yahooQuote(ySym) : Promise.resolve(null),
-          (result.eps == null || result.bookValue == null) ? yahooStats(ySym) : Promise.resolve(null),
-        ]);
-        if (qRes.status === 'fulfilled' && qRes.value?.price) {
-          result.price = qRes.value.price;
-          if (!result.currency && qRes.value.currency) result.currency = qRes.value.currency;
-        }
-        if (sRes.status === 'fulfilled' && sRes.value) {
-          if (result.eps       == null) result.eps       = sRes.value.eps       ?? null;
-          if (result.bookValue == null) result.bookValue = sRes.value.bookValue ?? null;
-        }
+        const yData = await yahooAll(ySym);
+        if (result.price     == null && yData.price     != null) result.price     = yData.price;
+        if (result.eps       == null && yData.eps       != null) result.eps       = yData.eps;
+        if (result.bookValue == null && yData.bookValue != null) result.bookValue = yData.bookValue;
+        if (!result.currency && yData.currency) result.currency = yData.currency;
+
         if (result.price != null || result.eps != null || result.bookValue != null) {
           if (ySym !== result.usedSymbol) result.usedSymbol = ySym;
           result.fiscalYear = result.fiscalYear ? result.fiscalYear + '+YF' : 'Yahoo TTM';
-          console.log(`[Yahoo] fallback succesvol via ${ySym}: price=${result.price}, eps=${result.eps}, bvps=${result.bookValue}`);
+          console.log(`[Yahoo] succesvol via ${ySym}: price=${result.price}, eps=${result.eps}, bvps=${result.bookValue}`);
           break;
         }
       } catch (e) {
@@ -1293,7 +1268,7 @@ async function fetchStock(stock) {
     const has404 = statuses.includes(404);
     const has429 = statuses.includes(429);
     if      (has401)            result.errorNote = `Ongeldige API-key (401)`;
-    else if (has402 || has403)  result.errorNote = `Finnhub-plan vereist (HTTP ${has402 ? 402 : 403})`;
+    else if (has402 || has403)  result.errorNote = `Niet beschikbaar op gratis plan (probeer cache te wissen)`;
     else if (has429)            result.errorNote = `Rate limit (HTTP 429) — wacht 1 min`;
     else if (has404)            result.errorNote = `Ticker niet gevonden`;
     else                        result.errorNote = `HTTP ${statuses[0]}`;
